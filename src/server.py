@@ -1,35 +1,32 @@
 """
-LinkedIn MCP Server — Streamable HTTP with full OAuth discovery + DCR
-Perplexity requires:
-  1. /.well-known/oauth-protected-resource
-  2. /.well-known/oauth-authorization-server  (with registration_endpoint)
-  3. /oauth/register  (Dynamic Client Registration - RFC 7591)
-  4. /mcp  (the actual MCP endpoint)
+Job Search MCP Server — LinkedIn + Naukri
+Streamable HTTP with OAuth discovery + Dynamic Client Registration
+Deploy on Render. Connect via Perplexity custom connector.
 """
 
-import json
 import os
 import secrets
 import uuid
-from urllib.parse import urlencode
+from urllib.parse import urlencode, quote_plus
 
 import uvicorn
 from mcp.server.fastmcp import FastMCP
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, RedirectResponse
 from starlette.routing import Mount, Route
 
-mcp = FastMCP("linkedin-mcp")
+mcp = FastMCP("job-search-mcp")
 
-# In-memory client store (resets on restart — fine for open server)
+# In-memory client store
 REGISTERED_CLIENTS: dict[str, dict] = {}
+BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:8000").rstrip("/")
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Shared helpers
 # ---------------------------------------------------------------------------
 
-EXP_CODES = {
+LINKEDIN_EXP = {
     "internship": "1",
     "entry": "2",
     "associate": "3",
@@ -38,8 +35,35 @@ EXP_CODES = {
     "executive": "6",
 }
 
+NAUKRI_EXP = {
+    "0": "0to1",
+    "1": "1to3",
+    "2": "2to4",
+    "3": "3to5",
+    "4": "4to6",
+    "5": "5to8",
+    "7": "7to10",
+    "10": "10to15",
+}
 
-def _build_linkedin_search_url(
+NAUKRI_LOCATIONS = {
+    "hyderabad": "Hyderabad",
+    "bangalore": "Bangalore",
+    "mumbai": "Mumbai",
+    "chennai": "Chennai",
+    "pune": "Pune",
+    "delhi": "Delhi",
+    "noida": "Noida",
+    "gurgaon": "Gurgaon",
+    "remote": "Work+from+Home",
+}
+
+
+# ---------------------------------------------------------------------------
+# LINKEDIN TOOLS
+# ---------------------------------------------------------------------------
+
+def _linkedin_url(
     keyword: str,
     location: str = "",
     remote: bool = False,
@@ -55,8 +79,8 @@ def _build_linkedin_search_url(
         params["f_WT"] = "2"
     if easy_apply:
         params["f_AL"] = "true"
-    if experience_level and experience_level in EXP_CODES:
-        params["f_E"] = EXP_CODES[experience_level]
+    if experience_level and experience_level in LINKEDIN_EXP:
+        params["f_E"] = LINKEDIN_EXP[experience_level]
     if job_type:
         params["f_JT"] = job_type
     if days:
@@ -64,93 +88,259 @@ def _build_linkedin_search_url(
     return "https://www.linkedin.com/jobs/search/?" + urlencode(params)
 
 
-# ---------------------------------------------------------------------------
-# MCP Tools
-# ---------------------------------------------------------------------------
-
 @mcp.tool()
-def linkedin_search_jobs(keyword: str, location: str = "", remote: bool = False) -> str:
-    """Build a public LinkedIn job search URL for any keyword + location."""
-    url = _build_linkedin_search_url(keyword=keyword, location=location, remote=remote)
-    parts = [f"LinkedIn job search for '{keyword}'"]
-    if location:
-        parts.append(f" in {location}")
-    if remote:
-        parts.append(" (Remote only)")
-    return "\n".join(parts) + f"\n\nOpen in browser:\n{url}"
-
-
-@mcp.tool()
-def linkedin_build_search_url(
+def linkedin_search_jobs(
     keyword: str,
     location: str = "",
     remote: bool = False,
     easy_apply: bool = False,
     experience_level: str = "",
-    job_type: str = "",
-    days: int | None = None,
+    days: int = 7,
 ) -> str:
     """
-    Build a LinkedIn job search URL with full filter support.
+    Search LinkedIn jobs by keyword and location.
     experience_level: internship | entry | associate | mid-senior | director | executive
-    job_type: F (full-time) | P (part-time) | C (contract) | T (temporary) | I (internship)
-    days: posted within last N days
+    Returns a direct LinkedIn job search URL with filters applied.
     """
-    url = _build_linkedin_search_url(
-        keyword=keyword, location=location, remote=remote,
-        easy_apply=easy_apply, experience_level=experience_level,
-        job_type=job_type, days=days,
+    url = _linkedin_url(
+        keyword=keyword,
+        location=location,
+        remote=remote,
+        easy_apply=easy_apply,
+        experience_level=experience_level,
+        days=days,
     )
-    return f"LinkedIn search URL with filters:\n{url}"
-
-
-@mcp.tool()
-def linkedin_get_job_details(job_id: str) -> str:
-    """Return the canonical public LinkedIn job details page URL for a given job ID."""
-    return (
-        f"LinkedIn job details URL:\n"
-        f"https://www.linkedin.com/jobs/view/{job_id}/\n\n"
-        f"Open the URL above in your browser to see full job details."
-    )
-
-
-@mcp.tool()
-def linkedin_easy_apply_search(
-    keyword: str, location: str = "", experience_level: str = "", days: int = 7
-) -> str:
-    """Shortcut: build a LinkedIn Easy Apply job search URL."""
-    url = _build_linkedin_search_url(
-        keyword=keyword, location=location, easy_apply=True,
-        experience_level=experience_level, days=days,
-    )
-    return (
-        f"Easy Apply jobs for '{keyword}'"
-        + (f" in {location}" if location else "")
-        + f" (last {days} days):\n\n{url}"
-    )
+    label = f"LinkedIn: '{keyword}'"
+    if location:
+        label += f" in {location}"
+    if easy_apply:
+        label += " | Easy Apply"
+    if remote:
+        label += " | Remote"
+    label += f" | Last {days} days"
+    return f"{label}\n\n🔗 {url}"
 
 
 @mcp.tool()
 def linkedin_remote_jobs(
-    keyword: str, experience_level: str = "", easy_apply: bool = True, days: int = 7
+    keyword: str,
+    experience_level: str = "",
+    easy_apply: bool = True,
+    days: int = 7,
 ) -> str:
-    """Find fully remote LinkedIn jobs for any role/skill."""
-    url = _build_linkedin_search_url(
-        keyword=keyword, remote=True, easy_apply=easy_apply,
-        experience_level=experience_level, days=days,
+    """
+    Find fully remote LinkedIn jobs for any role.
+    experience_level: internship | entry | associate | mid-senior | director | executive
+    """
+    url = _linkedin_url(
+        keyword=keyword,
+        remote=True,
+        easy_apply=easy_apply,
+        experience_level=experience_level,
+        days=days,
     )
-    return f"Remote jobs for '{keyword}' (last {days} days):\n\n{url}"
+    return f"LinkedIn Remote: '{keyword}' | Last {days} days\n\n🔗 {url}"
 
 
 # ---------------------------------------------------------------------------
-# OAuth / Discovery endpoints
+# NAUKRI TOOLS
 # ---------------------------------------------------------------------------
 
-BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:8000").rstrip("/")
+def _naukri_url(
+    keyword: str,
+    location: str = "",
+    experience_min: int = 0,
+    experience_max: int = 0,
+    salary_min: int = 0,
+    job_type: str = "",
+    days: int = 0,
+) -> str:
+    """
+    Build a Naukri.com job search URL with filters.
+    """
+    slug = keyword.lower().replace(" ", "-")
+    loc_slug = location.lower().replace(" ", "-") if location else ""
 
+    # Naukri URL format: /keyword-jobs[/in-location][?filters]
+    if loc_slug:
+        base = f"https://www.naukri.com/{slug}-jobs-in-{loc_slug}"
+    else:
+        base = f"https://www.naukri.com/{slug}-jobs"
+
+    params: dict[str, str] = {}
+    if experience_min or experience_max:
+        params["experience"] = f"{experience_min}to{experience_max}"
+    if salary_min:
+        params["salary"] = str(salary_min)
+    if job_type:
+        params["jobType"] = job_type
+    if days:
+        params["jobAge"] = str(days)
+
+    if params:
+        return base + "?" + urlencode(params)
+    return base
+
+
+@mcp.tool()
+def naukri_search_jobs(
+    keyword: str,
+    location: str = "",
+    experience_min: int = 0,
+    experience_max: int = 0,
+    days: int = 7,
+) -> str:
+    """
+    Search Naukri.com for jobs by keyword, location and experience range.
+    Returns a direct Naukri search URL.
+    Example: keyword='Java Full Stack Developer', location='Hyderabad', experience_min=2, experience_max=4
+    """
+    url = _naukri_url(
+        keyword=keyword,
+        location=location,
+        experience_min=experience_min,
+        experience_max=experience_max,
+        days=days,
+    )
+    label = f"Naukri: '{keyword}'"
+    if location:
+        label += f" in {location}"
+    if experience_min or experience_max:
+        label += f" | {experience_min}-{experience_max} yrs exp"
+    label += f" | Last {days} days"
+    return f"{label}\n\n🔗 {url}"
+
+
+@mcp.tool()
+def naukri_easy_apply_jobs(
+    keyword: str,
+    location: str = "",
+    experience_min: int = 0,
+    experience_max: int = 0,
+    days: int = 7,
+) -> str:
+    """
+    Search Naukri.com for Easy Apply jobs (1-click apply).
+    Returns direct Naukri Easy Apply filtered URL.
+    """
+    url = _naukri_url(
+        keyword=keyword,
+        location=location,
+        experience_min=experience_min,
+        experience_max=experience_max,
+        days=days,
+    )
+    # Append Naukri easy apply filter
+    sep = "&" if "?" in url else "?"
+    url = url + sep + "jobType=easyApply"
+    label = f"Naukri Easy Apply: '{keyword}'"
+    if location:
+        label += f" in {location}"
+    if experience_min or experience_max:
+        label += f" | {experience_min}-{experience_max} yrs exp"
+    return f"{label}\n\n🔗 {url}"
+
+
+@mcp.tool()
+def naukri_remote_jobs(
+    keyword: str,
+    experience_min: int = 0,
+    experience_max: int = 0,
+    days: int = 7,
+) -> str:
+    """
+    Search Naukri.com for remote / work from home jobs.
+    """
+    url = _naukri_url(
+        keyword=keyword,
+        location="work-from-home",
+        experience_min=experience_min,
+        experience_max=experience_max,
+        days=days,
+    )
+    label = f"Naukri Remote: '{keyword}'"
+    if experience_min or experience_max:
+        label += f" | {experience_min}-{experience_max} yrs exp"
+    return f"{label}\n\n🔗 {url}"
+
+
+@mcp.tool()
+def naukri_company_jobs(
+    company: str,
+    keyword: str = "",
+    location: str = "",
+) -> str:
+    """
+    Find jobs at a specific company on Naukri.
+    Example: company='TCS', keyword='Java Developer', location='Hyderabad'
+    """
+    slug = company.lower().replace(" ", "-")
+    base = f"https://www.naukri.com/{slug}-jobs"
+    params: dict[str, str] = {}
+    if keyword:
+        params["title"] = keyword
+    if location:
+        params["location"] = location
+    url = base + ("?" + urlencode(params) if params else "")
+    return f"Naukri: Jobs at {company}" + (f" | {keyword}" if keyword else "") + f"\n\n🔗 {url}"
+
+
+@mcp.tool()
+def job_search_both(
+    keyword: str,
+    location: str = "",
+    experience_min: int = 0,
+    experience_max: int = 0,
+    easy_apply: bool = True,
+    days: int = 7,
+) -> str:
+    """
+    Search BOTH LinkedIn and Naukri simultaneously for any role.
+    Returns search URLs for both platforms in one response.
+    Perfect for maximum job discovery.
+    Example: keyword='Java Full Stack Developer', location='Hyderabad', experience_min=2, experience_max=4
+    """
+    # LinkedIn
+    exp_level = "associate" if experience_min >= 2 else "entry"
+    li_url = _linkedin_url(
+        keyword=keyword,
+        location=location,
+        easy_apply=easy_apply,
+        experience_level=exp_level,
+        days=days,
+    )
+
+    # Naukri
+    nk_url = _naukri_url(
+        keyword=keyword,
+        location=location,
+        experience_min=experience_min,
+        experience_max=experience_max,
+        days=days,
+    )
+    if easy_apply:
+        sep = "&" if "?" in nk_url else "?"
+        nk_url = nk_url + sep + "jobType=easyApply"
+
+    label = f"'{keyword}'"
+    if location:
+        label += f" in {location}"
+    if experience_min or experience_max:
+        label += f" | {experience_min}-{experience_max} yrs"
+
+    return (
+        f"🔍 Job Search: {label}\n"
+        f"━━━━━━━━━━━━━━━━━━━━━━\n"
+        f"💼 LinkedIn:\n🔗 {li_url}\n\n"
+        f"📋 Naukri:\n🔗 {nk_url}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# OAuth discovery + Dynamic Client Registration
+# ---------------------------------------------------------------------------
 
 async def oauth_protected_resource(request: Request) -> JSONResponse:
-    """RFC 9470 — resource server metadata."""
     return JSONResponse({
         "resource": BASE_URL,
         "authorization_servers": [BASE_URL],
@@ -160,7 +350,6 @@ async def oauth_protected_resource(request: Request) -> JSONResponse:
 
 
 async def oauth_authorization_server(request: Request) -> JSONResponse:
-    """RFC 8414 — authorization server metadata WITH registration_endpoint."""
     return JSONResponse({
         "issuer": BASE_URL,
         "authorization_endpoint": f"{BASE_URL}/oauth/authorize",
@@ -174,7 +363,6 @@ async def oauth_authorization_server(request: Request) -> JSONResponse:
 
 
 async def openid_configuration(request: Request) -> JSONResponse:
-    """OpenID Connect discovery stub."""
     return JSONResponse({
         "issuer": BASE_URL,
         "authorization_endpoint": f"{BASE_URL}/oauth/authorize",
@@ -188,35 +376,27 @@ async def openid_configuration(request: Request) -> JSONResponse:
 
 
 async def oauth_register(request: Request) -> JSONResponse:
-    """
-    RFC 7591 Dynamic Client Registration.
-    Perplexity calls this to get a client_id + client_secret automatically.
-    We auto-approve every registration — no real auth needed.
-    """
+    """RFC 7591 Dynamic Client Registration — auto-approve every client."""
     try:
         body = await request.json()
     except Exception:
         body = {}
-
     client_id = str(uuid.uuid4())
     client_secret = secrets.token_urlsafe(32)
-
     client_data = {
         "client_id": client_id,
         "client_secret": client_secret,
-        "client_name": body.get("client_name", "Perplexity MCP Client"),
+        "client_name": body.get("client_name", "MCP Client"),
         "redirect_uris": body.get("redirect_uris", []),
         "grant_types": body.get("grant_types", ["authorization_code"]),
         "response_types": body.get("response_types", ["code"]),
         "token_endpoint_auth_method": body.get("token_endpoint_auth_method", "none"),
     }
     REGISTERED_CLIENTS[client_id] = client_data
-
     return JSONResponse(client_data, status_code=201)
 
 
 async def oauth_token(request: Request) -> JSONResponse:
-    """Token endpoint — issues a dummy bearer token (server is open/public)."""
     return JSONResponse({
         "access_token": secrets.token_urlsafe(32),
         "token_type": "bearer",
@@ -226,28 +406,37 @@ async def oauth_token(request: Request) -> JSONResponse:
 
 
 async def oauth_authorize(request: Request) -> JSONResponse:
-    """Authorization endpoint stub."""
     redirect_uri = request.query_params.get("redirect_uri", "")
     code = secrets.token_urlsafe(16)
     state = request.query_params.get("state", "")
     if redirect_uri:
-        from starlette.responses import RedirectResponse
         sep = "&" if "?" in redirect_uri else "?"
         return RedirectResponse(url=f"{redirect_uri}{sep}code={code}&state={state}")
     return JSONResponse({"code": code, "state": state})
 
 
 async def health(request: Request) -> JSONResponse:
-    return JSONResponse({"status": "ok", "service": "linkedin-mcp-server"})
+    return JSONResponse({
+        "status": "ok",
+        "service": "job-search-mcp",
+        "tools": [
+            "linkedin_search_jobs",
+            "linkedin_remote_jobs",
+            "naukri_search_jobs",
+            "naukri_easy_apply_jobs",
+            "naukri_remote_jobs",
+            "naukri_company_jobs",
+            "job_search_both",
+        ]
+    })
 
 
 # ---------------------------------------------------------------------------
-# Build combined ASGI app
+# Build ASGI app
 # ---------------------------------------------------------------------------
 
 def build_app():
     mcp_asgi = mcp.streamable_http_app()
-
     routes = [
         Route("/.well-known/oauth-protected-resource", oauth_protected_resource),
         Route("/.well-known/oauth-protected-resource/mcp", oauth_protected_resource),
@@ -259,11 +448,9 @@ def build_app():
         Route("/health", health),
         Mount("/mcp", app=mcp_asgi),
     ]
-
     return Starlette(routes=routes)
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    app = build_app()
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(build_app(), host="0.0.0.0", port=port)

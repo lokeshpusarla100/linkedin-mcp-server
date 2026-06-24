@@ -1,12 +1,12 @@
 """
-LinkedIn MCP Server — HTTP transport (Streamable HTTP / SSE)
+LinkedIn MCP Server — HTTP transport (Streamable HTTP)
 Deploy to Render for free. Paste the public URL into Perplexity custom connector.
 """
 
-import json
 import os
 from urllib.parse import urlencode
 
+import uvicorn
 from mcp.server.fastmcp import FastMCP
 
 mcp = FastMCP("linkedin-mcp")
@@ -162,9 +162,11 @@ def linkedin_remote_jobs(
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Entry point — use uvicorn directly so we control host + port
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=port, path="/mcp")
+    # Get the ASGI app from FastMCP and serve it with uvicorn
+    app = mcp.streamable_http_app()
+    uvicorn.run(app, host="0.0.0.0", port=port)

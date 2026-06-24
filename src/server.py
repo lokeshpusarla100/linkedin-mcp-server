@@ -5,6 +5,7 @@ import uvicorn
 import httpx
 from bs4 import BeautifulSoup
 
+import mcp.types as types
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
 from starlette.applications import Starlette
@@ -28,7 +29,6 @@ TOP_TIER_COMPANIES = [
     "goldman sachs", "morgan stanley", "jpmorgan", "mckinsey",
 ]
 
-# Exclude over-experienced or management-heavy roles
 AVOID_TITLES = [
     "senior", "lead", "principal", "staff", "architect",
     "manager", "director", "avp", "vp", "level iii",
@@ -45,12 +45,10 @@ COMMON_SKILLS = [
 ]
 
 def _is_top_tier(company_name: str) -> bool:
-    name_lower = company_name.lower()
-    return any(t in name_lower for t in TOP_TIER_COMPANIES)
+    return any(t in company_name.lower() for t in TOP_TIER_COMPANIES)
 
 def _should_avoid_title(title: str) -> bool:
-    title_lower = title.lower()
-    return any(t in title_lower for t in AVOID_TITLES)
+    return any(t in title.lower() for t in AVOID_TITLES)
 
 # ---------------------------------------------------------------------------
 # Core Logic & Resume Parsing
@@ -60,12 +58,8 @@ def parse_resume(resume_text: str) -> dict:
     text_lower = resume_text.lower()
     found_skills = [s for s in COMMON_SKILLS if s in text_lower]
     
-    exp_patterns = [
-        r"(\d+)\+?\s*years?\s*(?:of\s*)?experience",
-        r"experience\s*(?:of\s*)?(\d+)\+?\s*years?",
-    ]
     years = 0
-    for pat in exp_patterns:
+    for pat in [r"(\d+)\+?\s*years?\s*(?:of\s*)?experience", r"experience\s*(?:of\s*)?(\d+)\+?\s*years?"]:
         m = re.search(pat, text_lower)
         if m:
             years = int(m.group(1))
@@ -79,7 +73,6 @@ def score_job_match(job: dict, resume_data: dict) -> int:
     resume_years = resume_data.get("experience_years", 0)
     
     job_text = f"{job.get('title', '')} {job.get('company', '')} {job.get('description', '')}".lower()
-    
     matched_skills = [s for s in resume_skills if s in job_text]
     score += min(60, len(matched_skills) * 8)
     
@@ -122,7 +115,6 @@ def _search_jobs_sync(keyword: str, location: str, hours_old: int, results_wante
             company = str(row.get("company", ""))
             title = str(row.get("title", ""))
             
-            # Backend pre-filter for clean tracking
             if _should_avoid_title(title) or _is_top_tier(company):
                 continue
                 
@@ -130,24 +122,19 @@ def _search_jobs_sync(keyword: str, location: str, hours_old: int, results_wante
                 "title": title,
                 "company": company,
                 "location": str(row.get("location", "")),
-                "salary": str(row.get("salary_source", "")),
-                "description": str(row.get("description", ""))[:500],
                 "job_url": str(row.get("job_url", "")),
-                "site": str(row.get("site", "")),
+                "description": str(row.get("description", ""))[:500]
             })
         return jobs
     except Exception as e:
         return [{"error": str(e)}]
 
 # ---------------------------------------------------------------------------
-# MCP Tools
+# Tool Implementations
 # ---------------------------------------------------------------------------
 
-@mcp.tool()
-async def search_and_match_jobs(query: str, resume_text: str, location: str = "Hyderabad, India", top_n: int = 3) -> str:
-    """Searches live jobs, strips out high-level/top-tier roles, and matches against a resume."""
+async def search_and_match_jobs_logic(query: str, resume_text: str, location: str, top_n: int) -> str:
     resume_data = parse_resume(resume_text)
-    
     loop = asyncio.get_event_loop()
     jobs = await loop.run_in_executor(
         None, 
@@ -156,7 +143,6 @@ async def search_and_match_jobs(query: str, resume_text: str, location: str = "H
     
     if jobs and jobs[0].get("error"):
         return f"Error: {jobs[0]['error']}"
-        
     if not jobs:
         return "No matching mid-tier/appropriate experience jobs found right now."
 
@@ -172,10 +158,8 @@ async def search_and_match_jobs(query: str, resume_text: str, location: str = "H
         
     return "\n".join(lines)
 
-@mcp.tool()
-async def fetch_job_description(job_url: str) -> str:
-    """Fetches the full text of a job description from a URL."""
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+async def fetch_job_description_logic(job_url: str) -> str:
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
     try:
         async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
             resp = await client.get(job_url, headers=headers)
@@ -187,25 +171,72 @@ async def fetch_job_description(job_url: str) -> str:
         return f"Could not fetch JD: {str(e)}"
 
 # ---------------------------------------------------------------------------
+# MCP Tool Registration (Official v1.0.0 Syntax)
+# ---------------------------------------------------------------------------
+
+@mcp.list_tools()
+async def handle_list_tools() -> list[types.Tool]:
+    return [
+        types.Tool(
+            name="search_and_match_jobs",
+            description="Searches live jobs, strips out high-level/top-tier roles, and matches against a resume.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Job title to search"},
+                    "resume_text": {"type": "string", "description": "Your full resume text"},
+                    "location": {"type": "string", "default": "Hyderabad, India"},
+                    "top_n": {"type": "integer", "default": 3}
+                },
+                "required": ["query", "resume_text"]
+            }
+        ),
+        types.Tool(
+            name="fetch_job_description",
+            description="Fetches the full text of a job description from a URL.",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "job_url": {"type": "string", "description": "URL of the job posting"}
+                },
+                "required": ["job_url"]
+            }
+        )
+    ]
+
+@mcp.call_tool()
+async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent]:
+    if name == "search_and_match_jobs":
+        result = await search_and_match_jobs_logic(
+            arguments.get("query"),
+            arguments.get("resume_text"),
+            arguments.get("location", "Hyderabad, India"),
+            arguments.get("top_n", 3)
+        )
+        return [types.TextContent(type="text", text=result)]
+        
+    elif name == "fetch_job_description":
+        result = await fetch_job_description_logic(arguments.get("job_url"))
+        return [types.TextContent(type="text", text=result)]
+        
+    raise ValueError(f"Unknown tool: {name}")
+
+# ---------------------------------------------------------------------------
 # Server Initialization (SSE Transport for Render)
 # ---------------------------------------------------------------------------
 
 sse = SseServerTransport("/messages/")
 
 async def handle_sse(request: Request):
-    async with sse.connect_sse(
-        request.scope,
-        request.receive,
-        request._send,
-    ) as (read_stream, write_stream):
+    async with sse.connect_sse(request.scope, request.receive, request._send) as (read_stream, write_stream):
         await mcp.run(
             read_stream,
             write_stream,
-            mcp.create_initialization_options(),
+            mcp.create_initialization_options()
         )
 
 async def health_check(request: Request):
-    return JSONResponse({"status": "ok", "version": "4.2"})
+    return JSONResponse({"status": "ok", "version": "4.3 (Final)"})
 
 app = Starlette(
     routes=[

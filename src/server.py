@@ -1,13 +1,20 @@
 """
-LinkedIn MCP Server — HTTP transport (Streamable HTTP)
-Deploy to Render for free. Paste the public URL into Perplexity custom connector.
+LinkedIn MCP Server — Streamable HTTP with OAuth discovery stubs
+Perplexity requires /.well-known/oauth-protected-resource to exist.
+This server uses open (no-auth) access — the OAuth endpoints just tell
+Perplexity that no token is needed.
 """
 
+import json
 import os
 from urllib.parse import urlencode
 
 import uvicorn
 from mcp.server.fastmcp import FastMCP
+from starlette.applications import Starlette
+from starlette.requests import Request
+from starlette.responses import JSONResponse, Response
+from starlette.routing import Mount, Route
 
 mcp = FastMCP("linkedin-mcp")
 
@@ -123,7 +130,6 @@ def linkedin_easy_apply_search(
 ) -> str:
     """
     Shortcut: build a LinkedIn Easy Apply job search URL.
-    Perfect for quickly finding jobs you can apply to with one click.
     experience_level: internship | entry | associate | mid-senior | director | executive
     """
     url = _build_linkedin_search_url(
@@ -149,7 +155,6 @@ def linkedin_remote_jobs(
 ) -> str:
     """
     Find fully remote LinkedIn jobs for any role/skill.
-    Returns a ready-to-open search URL filtered to remote positions.
     """
     url = _build_linkedin_search_url(
         keyword=keyword,
@@ -162,11 +167,79 @@ def linkedin_remote_jobs(
 
 
 # ---------------------------------------------------------------------------
-# Entry point — use uvicorn directly so we control host + port
+# OAuth discovery stubs — Perplexity probes these before connecting
+# We declare this as an open (public) resource with no auth required.
 # ---------------------------------------------------------------------------
+
+BASE_URL = os.environ.get("RENDER_EXTERNAL_URL", "http://localhost:8000")
+
+
+async def oauth_protected_resource(request: Request) -> JSONResponse:
+    """RFC 9470 — tells clients this resource needs no token (open access)."""
+    return JSONResponse({
+        "resource": BASE_URL,
+        "authorization_servers": [],
+        "bearer_methods_supported": [],
+        "resource_signing_alg_values_supported": [],
+        "scopes_supported": [],
+        "resource_documentation": f"{BASE_URL}/mcp",
+    })
+
+
+async def oauth_authorization_server(request: Request) -> JSONResponse:
+    """Minimal OAuth AS metadata — no auth flow needed."""
+    return JSONResponse({
+        "issuer": BASE_URL,
+        "authorization_endpoint": f"{BASE_URL}/oauth/authorize",
+        "token_endpoint": f"{BASE_URL}/oauth/token",
+        "response_types_supported": ["code"],
+        "grant_types_supported": ["authorization_code"],
+    })
+
+
+async def openid_configuration(request: Request) -> JSONResponse:
+    """OpenID Connect discovery — minimal stub."""
+    return JSONResponse({
+        "issuer": BASE_URL,
+        "authorization_endpoint": f"{BASE_URL}/oauth/authorize",
+        "token_endpoint": f"{BASE_URL}/oauth/token",
+        "jwks_uri": f"{BASE_URL}/.well-known/jwks.json",
+        "response_types_supported": ["code"],
+        "subject_types_supported": ["public"],
+        "id_token_signing_alg_values_supported": ["RS256"],
+    })
+
+
+async def health(request: Request) -> JSONResponse:
+    return JSONResponse({"status": "ok", "service": "linkedin-mcp-server"})
+
+
+# ---------------------------------------------------------------------------
+# Build combined ASGI app: MCP + well-known routes
+# ---------------------------------------------------------------------------
+
+def build_app():
+    mcp_asgi = mcp.streamable_http_app()
+
+    well_known_routes = [
+        Route("/.well-known/oauth-protected-resource", oauth_protected_resource),
+        Route("/.well-known/oauth-protected-resource/mcp", oauth_protected_resource),
+        Route("/.well-known/oauth-authorization-server", oauth_authorization_server),
+        Route("/.well-known/openid-configuration", openid_configuration),
+        Route("/health", health),
+    ]
+
+    # Wrap MCP app under /mcp prefix and add well-known routes at root
+    app = Starlette(
+        routes=[
+            *well_known_routes,
+            Mount("/mcp", app=mcp_asgi),
+        ]
+    )
+    return app
+
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    # Get the ASGI app from FastMCP and serve it with uvicorn
-    app = mcp.streamable_http_app()
+    app = build_app()
     uvicorn.run(app, host="0.0.0.0", port=port)

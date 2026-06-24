@@ -2,11 +2,15 @@ import os
 import re
 import asyncio
 import uvicorn
-from fastapi import FastAPI
-from mcp.server import Server
-from mcp.server.fastapi import create_app
 import httpx
 from bs4 import BeautifulSoup
+
+from mcp.server import Server
+from mcp.server.sse import SseServerTransport
+from starlette.applications import Starlette
+from starlette.routing import Route, Mount
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 
 # Initialize Standard MCP Server
 mcp = Server("DailyJobHunter")
@@ -183,16 +187,33 @@ async def fetch_job_description(job_url: str) -> str:
         return f"Could not fetch JD: {str(e)}"
 
 # ---------------------------------------------------------------------------
-# Server Initialization
+# Server Initialization (SSE Transport for Render)
 # ---------------------------------------------------------------------------
 
-app = FastAPI(title="DailyJobHunter MCP")
-mcp_app = create_app(mcp)
-app.mount("/sse", mcp_app)
+sse = SseServerTransport("/messages/")
 
-@app.get("/health")
-def health_check():
-    return {"status": "ok", "version": "4.1"}
+async def handle_sse(request: Request):
+    async with sse.connect_sse(
+        request.scope,
+        request.receive,
+        request._send,
+    ) as (read_stream, write_stream):
+        await mcp.run(
+            read_stream,
+            write_stream,
+            mcp.create_initialization_options(),
+        )
+
+async def health_check(request: Request):
+    return JSONResponse({"status": "ok", "version": "4.2"})
+
+app = Starlette(
+    routes=[
+        Route("/sse", endpoint=handle_sse),
+        Mount("/messages/", app=sse.handle_post_message),
+        Route("/health", endpoint=health_check),
+    ]
+)
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))

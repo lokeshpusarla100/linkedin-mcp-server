@@ -1,7 +1,8 @@
-fastmcp>=2.0
+mcp==1.0.0
+fastapi
 uvicorn
-starlette
+python-jobspy
+pandas
 httpx
 beautifulsoup4
 lxml
-python-jobspy

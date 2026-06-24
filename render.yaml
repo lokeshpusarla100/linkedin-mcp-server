@@ -1,10 +1,10 @@
 services:
   - type: web
-    name: linkedin-mcp-server
+    name: daily-job-hunter
     runtime: python
     buildCommand: pip install -r requirements.txt
     startCommand: python src/server.py
+    healthCheckPath: /health
     envVars:
       - key: PORT
         value: 8000
-    plan: free

@@ -1,4 +1,7 @@
-mcp[cli]
+fastmcp>=2.0
 uvicorn
 starlette
 httpx
+beautifulsoup4
+lxml
+python-jobspy

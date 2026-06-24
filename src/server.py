@@ -35,9 +35,10 @@ AVOID_TITLES = [
     "level iv", "sde iii", "sde iv", "l5", "l6"
 ]
 
+# Expanded to catch your specific stack effectively
 COMMON_SKILLS = [
     "python", "java", "javascript", "typescript", "go", "rust", "c++", "c#",
-    "react", "angular", "vue", "node", "django", "flask", "spring", "fastapi",
+    "react", "angular", "vue", "node", "django", "flask", "spring", "spring boot", "fastapi",
     "aws", "azure", "gcp", "docker", "kubernetes", "terraform", "ansible",
     "postgresql", "mysql", "mongodb", "redis", "kafka", "rabbitmq",
     "machine learning", "llm", "rest", "graphql", "grpc", "microservices", 
@@ -74,6 +75,8 @@ def score_job_match(job: dict, resume_data: dict) -> int:
     
     job_text = f"{job.get('title', '')} {job.get('company', '')} {job.get('description', '')}".lower()
     matched_skills = [s for s in resume_skills if s in job_text]
+    
+    # Reward heavy skill overlap
     score += min(60, len(matched_skills) * 8)
     
     exp_req = 0
@@ -129,28 +132,75 @@ def _search_jobs_sync(keyword: str, location: str, hours_old: int, results_wante
     except Exception as e:
         return [{"error": str(e)}]
 
+async def fetch_job_description_logic(job_url: str) -> str:
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+    try:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            resp = await client.get(job_url, headers=headers)
+            soup = BeautifulSoup(resp.text, "lxml")
+            for tag in soup(["script", "style", "nav", "footer", "header"]):
+                tag.decompose()
+            return soup.get_text(separator="\n", strip=True)[:3000]
+    except:
+        return ""
+
 # ---------------------------------------------------------------------------
-# Tool Implementations
+# Tool Implementations (The Two-Pass Engine)
 # ---------------------------------------------------------------------------
 
 async def search_and_match_jobs_logic(query: str, resume_text: str, location: str, top_n: int) -> str:
     resume_data = parse_resume(resume_text)
     loop = asyncio.get_event_loop()
-    jobs = await loop.run_in_executor(
+    
+    # Pass 1: Fetch fresh jobs (Strict 72-hour window)
+    raw_jobs = await loop.run_in_executor(
         None, 
-        lambda: _search_jobs_sync(keyword=query, location=location, hours_old=168, results_wanted=35)
+        lambda: _search_jobs_sync(keyword=query, location=location, hours_old=72, results_wanted=40)
     )
     
-    if jobs and jobs[0].get("error"):
-        return f"Error: {jobs[0]['error']}"
-    if not jobs:
-        return "No matching mid-tier/appropriate experience jobs found right now."
+    if raw_jobs and raw_jobs[0].get("error"):
+        return f"Error: {raw_jobs[0]['error']}"
+    if not raw_jobs:
+        return "No matching fresh jobs found in the last 72 hours."
 
-    scored = [(j, score_job_match(j, resume_data)) for j in jobs]
-    scored.sort(key=lambda x: x[1], reverse=True)
-    top_jobs = scored[:top_n]
+    # De-duplicate based on Title + Company (Fixes the FedEx issue)
+    seen = set()
+    unique_jobs = []
+    for job in raw_jobs:
+        identifier = f"{job['title'].lower()}|{job['company'].lower()}"
+        if identifier not in seen:
+            seen.add(identifier)
+            unique_jobs.append(job)
 
-    lines = [f"🎯 Target Match Results: {query}\n"]
+    # Pass 2: Shallow Score
+    first_pass = [(j, score_job_match(j, resume_data)) for j in unique_jobs]
+    first_pass.sort(key=lambda x: x[1], reverse=True)
+    
+    # Pass 3: Deep Fetch JDs for the top 8 candidates to get real scores
+    candidates = [j for j, score in first_pass[:8]]
+    final_scored = []
+    
+    for j in candidates:
+        full_jd_text = j['description']
+        if j.get('job_url'):
+            fetched = await fetch_job_description_logic(j['job_url'])
+            if fetched:
+                full_jd_text = fetched
+                
+        # Temporarily swap snippet for full text to run the deep score
+        temp_desc = j['description']
+        j['description'] = full_jd_text
+        deep_score = score_job_match(j, resume_data)
+        j['description'] = temp_desc 
+        
+        final_scored.append((j, deep_score))
+
+    final_scored.sort(key=lambda x: x[1], reverse=True)
+    top_jobs = final_scored[:top_n]
+
+    lines = [f"🎯 Deep Match Results for: {query}"]
+    lines.append(f"🔍 Evaluated {len(unique_jobs)} unique listings against your skills: {', '.join(resume_data['skills'][:6])}...\n")
+    
     for rank, (j, score) in enumerate(top_jobs, 1):
         lines.append(f"#{rank} Match — {score}/100 ✅")
         lines.append(f"Role: {j['title']} at {j['company']}")
@@ -158,20 +208,8 @@ async def search_and_match_jobs_logic(query: str, resume_text: str, location: st
         
     return "\n".join(lines)
 
-async def fetch_job_description_logic(job_url: str) -> str:
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    try:
-        async with httpx.AsyncClient(timeout=15, follow_redirects=True) as client:
-            resp = await client.get(job_url, headers=headers)
-            soup = BeautifulSoup(resp.text, "lxml")
-            for tag in soup(["script", "style", "nav", "footer", "header"]):
-                tag.decompose()
-            return soup.get_text(separator="\n", strip=True)[:3000]
-    except Exception as e:
-        return f"Could not fetch JD: {str(e)}"
-
 # ---------------------------------------------------------------------------
-# MCP Tool Registration (Official v1.0.0 Syntax)
+# MCP Tool Registration
 # ---------------------------------------------------------------------------
 
 @mcp.list_tools()
@@ -179,7 +217,7 @@ async def handle_list_tools() -> list[types.Tool]:
     return [
         types.Tool(
             name="search_and_match_jobs",
-            description="Searches live jobs, strips out high-level/top-tier roles, and matches against a resume.",
+            description="Searches live jobs, de-duplicates, reads full JDs, and matches against a resume.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -189,17 +227,6 @@ async def handle_list_tools() -> list[types.Tool]:
                     "top_n": {"type": "integer", "default": 3}
                 },
                 "required": ["query", "resume_text"]
-            }
-        ),
-        types.Tool(
-            name="fetch_job_description",
-            description="Fetches the full text of a job description from a URL.",
-            inputSchema={
-                "type": "object",
-                "properties": {
-                    "job_url": {"type": "string", "description": "URL of the job posting"}
-                },
-                "required": ["job_url"]
             }
         )
     ]
@@ -214,29 +241,20 @@ async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent
             arguments.get("top_n", 3)
         )
         return [types.TextContent(type="text", text=result)]
-        
-    elif name == "fetch_job_description":
-        result = await fetch_job_description_logic(arguments.get("job_url"))
-        return [types.TextContent(type="text", text=result)]
-        
     raise ValueError(f"Unknown tool: {name}")
 
 # ---------------------------------------------------------------------------
-# Server Initialization (SSE Transport for Render)
+# Server Initialization
 # ---------------------------------------------------------------------------
 
 sse = SseServerTransport("/messages/")
 
 async def handle_sse(request: Request):
     async with sse.connect_sse(request.scope, request.receive, request._send) as (read_stream, write_stream):
-        await mcp.run(
-            read_stream,
-            write_stream,
-            mcp.create_initialization_options()
-        )
+        await mcp.run(read_stream, write_stream, mcp.create_initialization_options())
 
 async def health_check(request: Request):
-    return JSONResponse({"status": "ok", "version": "4.3 (Final)"})
+    return JSONResponse({"status": "ok", "version": "5.0 (Deep Fetch & Dedupe)"})
 
 app = Starlette(
     routes=[

@@ -1,4 +1,5 @@
 import os
+import re
 import json
 import logging
 import asyncio
@@ -21,49 +22,24 @@ logger = logging.getLogger("JobPipeline")
 server = Server("IntelligentJobHunter")
 
 # ---------------------------------------------------------------------------
-# CANDIDATE PROFILE (embedded for semantic matching)
+# CANDIDATE SKILL KEYWORDS (for lightweight server-side ranking, no LLM)
 # ---------------------------------------------------------------------------
-MY_RESUME = """
-PROFESSIONAL SUMMARY
-Full Stack Engineer with 2.6 years of experience delivering production-grade microservices and RESTful
-APIs in a high-compliance American insurance platform using Java, Spring Boot, Angular, and AWS.
-Hands-on experience working within Kafka-based event-driven architectures and Redis-backed caching
-systems at enterprise scale. AWS Certified Developer – Associate with experience building scalable
-enterprise microservices, event-driven systems, and REST APIs in Agile environments with global teams.
+CORE_SKILLS = [
+    "java", "spring boot", "spring", "angular", "typescript", "javascript",
+    "microservices", "rest api", "restful", "kafka", "redis", "docker",
+    "aws", "jenkins", "ci/cd", "jpa", "hibernate", "junit", "maven", "git",
+    "mysql", "oracle", "sql", "spring cloud", "resilience4j", "cloudwatch",
+    "ec2", "s3", "lambda", "sqs", "api gateway", "html", "css", "rxjs",
+]
 
-TECHNICAL SKILLS
-Languages: Java 17/21, TypeScript, JavaScript
-Frontend: Angular, HTML5/CSS3
-Backend: Spring Boot, Spring Cloud (Config, Gateway), REST APIs, Microservices, JPA/Hibernate
-Backend Tech: Kafka, Redis, Resilience4j, JUnit 5, Mockito, Docker
-Cloud & DevOps: AWS (EC2, S3, IAM, RDS, Lambda, API Gateway, CloudWatch, SQS), Jenkins, CI/CD, Maven, Git
-Databases: Oracle, MySQL, SQL
-
-PROFESSIONAL EXPERIENCE
-Full Stack Engineer | Accenture — Hyderabad, India | May 2024 – Present
-American Insurance Domain | Oracle Legacy Migration | Microservices Platform
-
-- Contributed to delivery of 200+ REST APIs across Oracle-to-microservices migration
-- Built Experience Layer APIs orchestrating 80+ platform service operations
-- Developed Angular frontend with Reactive Forms, Angular Material, RxJS
-- Worked within Kafka-based event-driven architecture for async processing
-- Contributed to Redis-backed caching layer with Azure AD authentication
-- Monitored service health via AWS CloudWatch and EC2 console
-- Resolved 40+ production defects through systematic root cause analysis
-- Authored Swagger/OpenAPI documentation for all delivered APIs
-- Leveraged GitHub Copilot and AI-assisted tooling for delivery acceleration
-"""
-
-CANDIDATE_YEARS = 2.6
-
-# Multi-query strategy for broader coverage
+# Multi-query strategy for broad coverage
 SEARCH_QUERIES = [
     "Java Spring Boot Developer",
     "Full Stack Java Angular Developer",
     "Backend Engineer Microservices",
 ]
 
-# Only block pure recruitment/staffing agencies (not IT service companies)
+# Only block pure recruitment/staffing agencies
 STAFFING_AGENCIES = [
     "randstad", "manpowergroup", "collabera", "teksystems",
     "adecco", "kelly services", "robert half", "hays",
@@ -80,65 +56,82 @@ SKIP_TITLES = [
 SCRAPE_CACHE = {"timestamp": None, "data": []}
 CACHE_HOURS = 6
 
-# Gemini rate limiter — max 5 concurrent calls to stay under 30 RPM
-GEMINI_SEM = asyncio.Semaphore(5)
-
 
 # ---------------------------------------------------------------------------
 # UTILITIES
 # ---------------------------------------------------------------------------
 def _hash_url(url: str) -> str:
-    """Short hash for dedup."""
     return hashlib.sha256(url.strip().encode()).hexdigest()[:16]
 
 
-def _extract_json(raw: str) -> dict:
-    """Robustly extract JSON from Gemini response (handles markdown fences)."""
-    try:
-        text = raw.strip()
-        if "```json" in text:
-            text = text.split("```json")[1].split("```")[0].strip()
-        elif "```" in text:
-            text = text.split("```")[1].split("```")[0].strip()
-        return json.loads(text)
-    except Exception as e:
-        logger.error(f"JSON parse failed: {e}")
-        return {}
+def _keyword_score(jd_text: str) -> tuple[int, list[str]]:
+    """Count how many candidate skills appear in JD text. No LLM needed."""
+    jd_lower = jd_text.lower()
+    matched = [skill for skill in CORE_SKILLS if skill in jd_lower]
+    return len(matched), matched
 
 
-async def _gemini(prompt: str) -> str:
-    """Call Gemini 2.5 Flash with rate limiting."""
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        return '{"error": "GEMINI_API_KEY missing"}'
+CANDIDATE_YEARS = 2.6
+MIN_SKILL_HITS = 3  # Jobs with fewer than 3 matching skills are noise
 
-    url = (
-        "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"gemini-2.5-flash:generateContent?key={api_key}"
-    )
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {"responseMimeType": "application/json"},
-    }
+# Senior threshold — only reject if minimum experience is this or higher
+TOO_SENIOR_MIN = 5
 
-    async with GEMINI_SEM:
-        try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
-                resp = await client.post(
-                    url, headers={"Content-Type": "application/json"}, json=payload
-                )
-                resp.raise_for_status()
-                return resp.json()["candidates"][0]["content"]["parts"][0]["text"]
-        except Exception as e:
-            logger.error(f"Gemini API failed: {e}")
-            return "{}"
+
+def _extract_experience_numbers(jd_text: str) -> list[int]:
+    """
+    Extract ALL numbers that appear near experience-related words.
+    Handles every format: "2-4 years", "2+ yrs", "minimum 2 years",
+    "two plus years", "experience: 3-5", "at least 4 yrs", etc.
+    Returns sorted list of all numbers found near experience context.
+    """
+    numbers = []
+
+    # Split JD into chunks around experience-related keywords
+    # Look for numbers within 60 chars of these words
+    exp_keywords = r"(?:experience|exp|years?|yrs?)"
+    # Find all regions containing experience keywords
+    for match in re.finditer(exp_keywords, jd_text, re.IGNORECASE):
+        start = max(0, match.start() - 60)
+        end = min(len(jd_text), match.end() + 60)
+        region = jd_text[start:end]
+
+        # Extract all digits from this region
+        for num_match in re.finditer(r"\b(\d{1,2})\b", region):
+            val = int(num_match.group(1))
+            # Only care about reasonable experience values (0-20)
+            if 0 <= val <= 20:
+                numbers.append(val)
+
+    return sorted(set(numbers))
+
+
+def _experience_qualifies(jd_text: str) -> tuple[bool, str]:
+    """
+    Check if candidate's 2.6 years fits the JD.
+    Philosophy: DEFAULT IS INCLUDE. Only reject when we're very confident
+    the role requires 5+ years minimum.
+    """
+    nums = _extract_experience_numbers(jd_text)
+
+    if not nums:
+        return True, "No experience numbers found — included"
+
+    min_num = nums[0]  # smallest number found near experience context
+    max_num = nums[-1]  # largest
+
+    # If the smallest number mentioned is already >= 5, too senior
+    if min_num >= TOO_SENIOR_MIN:
+        return False, f"Requires {min_num}+ years — too senior"
+
+    # Range like 0-3, 1-4, 2-5 etc — we qualify
+    return True, f"Experience range {min_num}-{max_num} years — qualifies"
 
 
 # ---------------------------------------------------------------------------
 # SUPABASE DEDUP (optional — works without it)
 # ---------------------------------------------------------------------------
 def _supa_headers() -> dict | None:
-    """Return Supabase auth headers, or None if not configured."""
     url = os.environ.get("SUPABASE_URL")
     key = os.environ.get("SUPABASE_ANON_KEY")
     if not url or not key:
@@ -151,12 +144,10 @@ def _supa_headers() -> dict | None:
 
 
 async def _check_seen(url_hashes: list[str]) -> set[str]:
-    """Check which job URL hashes exist in Supabase. Returns set of seen hashes."""
     headers = _supa_headers()
     base = os.environ.get("SUPABASE_URL", "")
     if not headers or not url_hashes:
         return set()
-
     try:
         hash_csv = ",".join(url_hashes)
         endpoint = f"{base}/rest/v1/seen_jobs?url_hash=in.({hash_csv})&select=url_hash"
@@ -170,12 +161,10 @@ async def _check_seen(url_hashes: list[str]) -> set[str]:
 
 
 async def _mark_seen(jobs: list[dict]) -> None:
-    """Insert scored jobs into Supabase seen_jobs table."""
     headers = _supa_headers()
     base = os.environ.get("SUPABASE_URL", "")
     if not headers or not jobs:
         return
-
     try:
         headers["Prefer"] = "resolution=ignore-duplicates"
         rows = [
@@ -183,8 +172,7 @@ async def _mark_seen(jobs: list[dict]) -> None:
                 "url_hash": j["url_hash"],
                 "title": j.get("title", "")[:200],
                 "company": j.get("company", "")[:100],
-                "match_score": j.get("match_score", 0),
-                "verdict": j.get("verdict", ""),
+                "skill_hits": j.get("skill_hits", 0),
             }
             for j in jobs
         ]
@@ -192,7 +180,7 @@ async def _mark_seen(jobs: list[dict]) -> None:
         async with httpx.AsyncClient(timeout=10.0) as client:
             resp = await client.post(endpoint, headers=headers, json=rows)
             resp.raise_for_status()
-            logger.info(f"Marked {len(rows)} jobs as seen in Supabase")
+            logger.info(f"Marked {len(rows)} jobs as seen")
     except Exception as e:
         logger.warning(f"Supabase write failed: {e}")
 
@@ -201,11 +189,14 @@ async def _mark_seen(jobs: list[dict]) -> None:
 # PIPELINE STAGES
 # ---------------------------------------------------------------------------
 def stage_scrape() -> list[dict]:
-    """Stage 1: Multi-query scrape across platforms, deduplicate by URL."""
+    """Multi-query scrape across LinkedIn + Naukri, dedup by URL."""
     global SCRAPE_CACHE
     now = datetime.now()
 
-    if SCRAPE_CACHE["timestamp"] and (now - SCRAPE_CACHE["timestamp"]) < timedelta(hours=CACHE_HOURS):
+    if (
+        SCRAPE_CACHE["timestamp"]
+        and (now - SCRAPE_CACHE["timestamp"]) < timedelta(hours=CACHE_HOURS)
+    ):
         logger.info("Serving from in-memory cache")
         return SCRAPE_CACHE["data"]
 
@@ -215,7 +206,7 @@ def stage_scrape() -> list[dict]:
         logger.error("python-jobspy not installed")
         return []
 
-    all_jobs: dict[str, dict] = {}  # url -> job (natural dedup across queries)
+    all_jobs: dict[str, dict] = {}
 
     for query in SEARCH_QUERIES:
         logger.info(f"Scraping: '{query}'")
@@ -231,7 +222,6 @@ def stage_scrape() -> list[dict]:
             )
             if df is None or df.empty:
                 continue
-
             for _, row in df.iterrows():
                 url = str(row.get("job_url", "")).strip()
                 if url and url not in all_jobs:
@@ -254,7 +244,7 @@ def stage_scrape() -> list[dict]:
 
 
 def stage_pre_filter(jobs: list[dict]) -> list[dict]:
-    """Stage 2: Remove staffing agencies, wrong seniority, empty JDs."""
+    """Remove staffing agencies, wrong seniority, empty JDs."""
     filtered = []
     for job in jobs:
         title_lower = job["title"].lower()
@@ -273,77 +263,38 @@ def stage_pre_filter(jobs: list[dict]) -> list[dict]:
     return filtered
 
 
-async def stage_check_exp(jd_text: str) -> dict:
-    """Stage 3: Parse experience requirement from JD via Gemini."""
-    prompt = f"""Extract years of experience required from this job description.
-Candidate has {CANDIDATE_YEARS} years experience.
+def stage_experience_filter(jobs: list[dict]) -> list[dict]:
+    """Filter jobs by experience requirement using regex. No LLM."""
+    qualified = []
+    for job in jobs:
+        qualifies, reason = _experience_qualifies(job["jd_text"])
+        job["exp_check"] = reason
+        if qualifies:
+            qualified.append(job)
 
-Return ONLY this JSON:
-{{
-  "min_exp": <number or null if not stated>,
-  "max_exp": <number or null if not stated>,
-  "i_qualify": true/false,
-  "reason": "one sentence"
-}}
-
-Rules:
-- If experience is not clearly mentioned, i_qualify = true
-- Ranges like 0-3, 1-4, 2-5, 2-4 years -> i_qualify = true
-- If minimum required is 5+ years -> i_qualify = false
-- Focus on primary role requirements, ignore nice-to-have
-
-JD:
-{jd_text[:2500]}"""
-
-    raw = await _gemini(prompt)
-    result = _extract_json(raw)
-    if not result or "i_qualify" not in result:
-        return {"i_qualify": True, "reason": "Could not parse, assuming qualified"}
-    return result
+    logger.info(f"Experience filter: {len(jobs)} -> {len(qualified)}")
+    return qualified
 
 
-async def stage_score(jd_text: str) -> dict:
-    """Stage 4: Semantic resume match via Gemini."""
-    prompt = f"""You are a technical recruiter evaluating job fit for a candidate.
+def stage_rank(jobs: list[dict]) -> list[dict]:
+    """Rank by keyword overlap. Drop jobs below minimum skill threshold."""
+    for job in jobs:
+        hits, matched = _keyword_score(job["jd_text"])
+        job["skill_hits"] = hits
+        job["matched_keywords"] = matched
 
-## CANDIDATE RESUME
-{MY_RESUME}
+    # Drop jobs with too few matching skills
+    relevant = [j for j in jobs if j["skill_hits"] >= MIN_SKILL_HITS]
+    logger.info(f"Skill threshold ({MIN_SKILL_HITS}+): {len(jobs)} -> {len(relevant)}")
 
-## JOB DESCRIPTION
-{jd_text[:3500]}
-
-## SCORING RUBRIC (score 0-100)
-1. Tech Stack Overlap (50 points): How many candidate skills appear in the JD?
-   Use SEMANTIC matching: "Spring" ~ "Spring Boot", "AWS services" ~ specific AWS tools,
-   "REST" ~ "RESTful APIs", "microservice" ~ "microservices architecture".
-2. Experience Level Fit (25 points): Is this appropriate for {CANDIDATE_YEARS} years?
-   Ideal: 1-4 year roles. Too junior: 0-1. Too senior: 5+.
-3. Role Type Fit (25 points): Backend-heavy or full-stack roles score highest.
-   Pure frontend, data engineering, or DevOps-only roles score lower.
-
-## VERDICT
-- score >= 65 -> "APPLY NOW"
-- score 45-64 -> "APPLY AFTER PREP"
-- score < 45 -> "SKIP"
-
-Return ONLY this JSON:
-{{
-  "match_score": <0-100>,
-  "matched_skills": ["skills in BOTH resume and JD"],
-  "skill_gaps": ["important JD skills missing from resume"],
-  "verdict": "APPLY NOW" | "APPLY AFTER PREP" | "SKIP",
-  "fit_reason": "2 sentence explanation"
-}}"""
-
-    raw = await _gemini(prompt)
-    result = _extract_json(raw)
-    if not result or "match_score" not in result:
-        return {"match_score": 0, "verdict": "SKIP", "fit_reason": "Scoring failed"}
-    return result
+    ranked = sorted(relevant, key=lambda x: x["skill_hits"], reverse=True)
+    if ranked:
+        logger.info(f"Top: {ranked[0]['skill_hits']} hits, Bottom: {ranked[-1]['skill_hits']} hits")
+    return ranked
 
 
 # ---------------------------------------------------------------------------
-# MCP TOOL DEFINITION
+# MCP TOOL
 # ---------------------------------------------------------------------------
 @server.list_tools()
 async def handle_list_tools() -> list[types.Tool]:
@@ -351,18 +302,21 @@ async def handle_list_tools() -> list[types.Tool]:
         types.Tool(
             name="daily_job_report",
             description=(
-                "Scrapes fresh jobs from LinkedIn and Naukri using multiple search queries, "
-                "filters by experience and seniority, scores each job against the candidate's "
-                "full resume using AI semantic matching, deduplicates against previously seen "
-                "jobs, and returns the top 3 best matches with scores and reasoning."
+                "Scrapes fresh jobs from LinkedIn and Naukri across India using "
+                "multiple search queries optimized for Java/Spring Boot/Angular "
+                "full stack roles. Pre-filters by seniority, removes staffing "
+                "agencies, deduplicates against previously seen jobs, ranks by "
+                "skill keyword overlap, and returns the top matches with full "
+                "JD text for your analysis. Best used with: 'Run daily_job_report "
+                "and match results against my resume to find the top 3 I should apply to.'"
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "query": {
-                        "type": "string",
-                        "description": "Optional extra search query to add alongside defaults.",
-                        "default": "",
+                    "top_n": {
+                        "type": "integer",
+                        "description": "Number of top-ranked jobs to return (default 15).",
+                        "default": 15,
                     }
                 },
                 "required": [],
@@ -376,101 +330,72 @@ async def handle_call_tool(name: str, arguments: dict) -> list[types.TextContent
     if name != "daily_job_report":
         raise ValueError(f"Unknown tool: {name}")
 
-    extra_query = arguments.get("query", "").strip()
+    top_n = arguments.get("top_n", 15)
 
-    # Stage 1 — Scrape (sync, run in executor)
+    # Stage 1 — Scrape (blocking I/O, run in executor)
     loop = asyncio.get_running_loop()
     raw_jobs = await loop.run_in_executor(None, stage_scrape)
-    logger.info(f"[Stage 1] Scraped {len(raw_jobs)} raw jobs")
+    logger.info(f"[S1 Scrape] {len(raw_jobs)} raw jobs")
 
     # Stage 2 — Pre-filter
     filtered = stage_pre_filter(raw_jobs)
-    logger.info(f"[Stage 2] {len(filtered)} after pre-filter")
+    logger.info(f"[S2 Filter] {len(filtered)} after pre-filter")
 
-    # Stage 3 — Supabase dedup (skip if not configured)
+    # Stage 3 — Supabase dedup
     for job in filtered:
         job["url_hash"] = _hash_url(job["url"])
 
     all_hashes = [j["url_hash"] for j in filtered]
-    seen_hashes = await _check_seen(all_hashes)
-    unseen = [j for j in filtered if j["url_hash"] not in seen_hashes]
-    logger.info(f"[Stage 3] {len(unseen)} unseen jobs (deduped {len(seen_hashes)} seen)")
+    seen = await _check_seen(all_hashes)
+    unseen = [j for j in filtered if j["url_hash"] not in seen]
+    logger.info(f"[S3 Dedup] {len(unseen)} new ({len(seen)} already seen)")
 
-    # Stage 4 — Experience filter (parallel with rate limiting)
-    exp_tasks = [stage_check_exp(j["jd_text"]) for j in unseen]
-    exp_results = await asyncio.gather(*exp_tasks, return_exceptions=True)
+    # Stage 4 — Experience filter (regex, no LLM)
+    exp_qualified = stage_experience_filter(unseen)
+    logger.info(f"[S4 Exp] {len(exp_qualified)} experience-qualified")
 
-    qualified = []
-    for job, exp in zip(unseen, exp_results):
-        if isinstance(exp, Exception):
-            qualified.append(job)  # assume qualified on error
-        elif exp.get("i_qualify", True):
-            job["exp_info"] = exp
-            qualified.append(job)
+    # Stage 5 — Keyword rank + minimum skill threshold
+    ranked = stage_rank(exp_qualified)
+    logger.info(f"[S5 Rank] {len(ranked)} after skill threshold")
 
-    logger.info(f"[Stage 4] {len(qualified)} experience-qualified")
+    # Take top N
+    top_jobs = ranked[:top_n]
 
-    # Stage 5 — Semantic scoring (parallel with rate limiting)
-    score_tasks = [stage_score(j["jd_text"]) for j in qualified]
-    score_results = await asyncio.gather(*score_tasks, return_exceptions=True)
-
-    scored = []
-    for job, sc in zip(qualified, score_results):
-        if isinstance(sc, Exception):
-            continue
-        scored.append({
+    # Build results with JD preview for Perplexity
+    results = []
+    for rank, job in enumerate(top_jobs, 1):
+        results.append({
+            "rank": rank,
             "title": job["title"],
             "company": job["company"],
-            "location": job.get("location", ""),
+            "location": job["location"],
             "url": job["url"],
-            "url_hash": job["url_hash"],
-            "match_score": sc.get("match_score", 0),
-            "matched_skills": sc.get("matched_skills", []),
-            "skill_gaps": sc.get("skill_gaps", []),
-            "verdict": sc.get("verdict", "SKIP"),
-            "fit_reason": sc.get("fit_reason", ""),
+            "date_posted": job["date_posted"],
+            "skill_hits": job["skill_hits"],
+            "matched_keywords": job["matched_keywords"],
+            "exp_check": job.get("exp_check", ""),
+            "jd_preview": job["jd_text"][:2000],
         })
 
-    logger.info(f"[Stage 5] {len(scored)} jobs scored")
-
-    # Stage 6 — Rank and pick top 3
-    apply_now = sorted(
-        [j for j in scored if j["verdict"] == "APPLY NOW"],
-        key=lambda x: x["match_score"],
-        reverse=True,
-    )
-    apply_prep = sorted(
-        [j for j in scored if j["verdict"] == "APPLY AFTER PREP"],
-        key=lambda x: x["match_score"],
-        reverse=True,
-    )
-
-    top_3 = apply_now[:3]
-    if len(top_3) < 3:
-        top_3.extend(apply_prep[: 3 - len(top_3)])
-
-    for rank, job in enumerate(top_3, 1):
-        job["rank"] = rank
-
-    # Stage 7 — Mark all scored jobs as seen
-    await _mark_seen(scored)
+    # Mark all processed jobs as seen (not just top N)
+    await _mark_seen(ranked)
 
     report = {
         "date": datetime.now().strftime("%Y-%m-%d"),
         "pipeline": {
             "scraped": len(raw_jobs),
-            "after_filter": len(filtered),
+            "after_pre_filter": len(filtered),
             "new_unseen": len(unseen),
-            "exp_qualified": len(qualified),
-            "scored": len(scored),
-            "apply_now_count": len(apply_now),
-            "apply_prep_count": len(apply_prep),
+            "exp_qualified": len(exp_qualified),
+            "after_skill_threshold": len(ranked),
+            "returned": len(results),
         },
-        "top_matches": top_3,
-        "summary": (
-            f"Found {len(top_3)} matches from {len(raw_jobs)} scraped jobs."
-            if top_3
-            else "No strong matches today. New jobs will appear tomorrow."
+        "jobs": results,
+        "instructions": (
+            "These jobs passed experience check (2.6 years) and have 3+ matching "
+            "skills from the candidate's stack (Java, Spring Boot, Angular, AWS, "
+            "Kafka, Redis, Docker, Microservices). Analyze each JD against the "
+            "candidate's resume to pick the top 3 best matches."
         ),
     }
 
